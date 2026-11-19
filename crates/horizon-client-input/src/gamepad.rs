@@ -407,6 +407,34 @@ pub fn switch_keyboard(choice: TextKeyboard) -> bool {
     cfg!(target_os = "horizon") && choice == TextKeyboard::Auto
 }
 
+/// When the gyroscope turns the view (Horizon's; docs/controllers.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GyroMode {
+    #[default]
+    Off,
+    /// Always on, added to the right stick.
+    Always,
+    /// Only while the use button (ZL on a Switch) is held: stick for the big
+    /// turns, gyro for fine aim.
+    Aiming,
+}
+impl GyroMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            GyroMode::Off => "off",
+            GyroMode::Always => "always",
+            GyroMode::Aiming => "aiming",
+        }
+    }
+    pub fn parse(name: &str) -> Self {
+        match name {
+            "always" => GyroMode::Always,
+            "aiming" => GyroMode::Aiming,
+            _ => GyroMode::Off,
+        }
+    }
+}
+
 /// The controller settings (`horizon-controller.txt`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PadSettings {
@@ -433,6 +461,11 @@ pub struct PadSettings {
     /// How the pad drives menus: a focus highlight or a virtual pointer.
     pub menu_nav: MenuNav,
     pub keyboard: TextKeyboard,
+    pub gyro: GyroMode,
+    /// 0..1; 0.5 turns the view one degree per degree the pad turns, 1 twice that.
+    pub gyro_sensitivity: f32,
+    pub gyro_invert_x: bool,
+    pub gyro_invert_y: bool,
     /// Action name -> button, `None` for unbound; missing means the default.
     bindings: BTreeMap<&'static str, Option<Button>>,
 }
@@ -454,6 +487,14 @@ impl Default for PadSettings {
             nintendo_letters: cfg!(target_os = "horizon"),
             menu_nav: MenuNav::Focus,
             keyboard: TextKeyboard::Auto,
+            gyro: if cfg!(target_os = "horizon") {
+                GyroMode::Aiming
+            } else {
+                GyroMode::Off
+            },
+            gyro_sensitivity: 0.5,
+            gyro_invert_x: false,
+            gyro_invert_y: false,
             bindings: BTreeMap::new(),
         }
     }
@@ -512,6 +553,10 @@ impl PadSettings {
                 "nintendoLetters" => s.nintendo_letters = flag(s.nintendo_letters),
                 "menuNavigation" => s.menu_nav = MenuNav::parse(value),
                 "keyboard" => s.keyboard = TextKeyboard::parse(value),
+                "gyro" => s.gyro = GyroMode::parse(value),
+                "gyroSensitivity" => s.gyro_sensitivity = unit(s.gyro_sensitivity),
+                "gyroInvertX" => s.gyro_invert_x = flag(s.gyro_invert_x),
+                "gyroInvertY" => s.gyro_invert_y = flag(s.gyro_invert_y),
                 other => {
                     if let Some(action) = other.strip_prefix("bind_") {
                         let button = if value == "none" {
@@ -530,7 +575,7 @@ impl PadSettings {
     }
     pub fn serialize(&self) -> String {
         let mut text = format!(
-            "enabled:{}\nvibration:{}\nadaptiveTriggers:{}\nlightbar:{}\nlookSensitivity:{}\ninvertX:{}\ninvertY:{}\nmoveDeadzone:{}\nlookDeadzone:{}\ntriggerThreshold:{}\ntoggleSneak:{}\nglyphs:{}\nnintendoLetters:{}\nmenuNavigation:{}\nkeyboard:{}\n",
+            "enabled:{}\nvibration:{}\nadaptiveTriggers:{}\nlightbar:{}\nlookSensitivity:{}\ninvertX:{}\ninvertY:{}\nmoveDeadzone:{}\nlookDeadzone:{}\ntriggerThreshold:{}\ntoggleSneak:{}\nglyphs:{}\nnintendoLetters:{}\nmenuNavigation:{}\nkeyboard:{}\ngyro:{}\ngyroSensitivity:{}\ngyroInvertX:{}\ngyroInvertY:{}\n",
             bool_text(self.enabled),
             bool_text(self.vibration),
             bool_text(self.adaptive_triggers),
@@ -546,6 +591,10 @@ impl PadSettings {
             bool_text(self.nintendo_letters),
             self.menu_nav.name(),
             self.keyboard.name(),
+            self.gyro.name(),
+            self.gyro_sensitivity,
+            bool_text(self.gyro_invert_x),
+            bool_text(self.gyro_invert_y),
         );
         for (action, button) in &self.bindings {
             text.push_str(&format!(
@@ -601,6 +650,34 @@ fn length(v: [f32; 2]) -> f32 {
     (v[0] * v[0] + v[1] * v[1]).sqrt()
 }
 
+/// 8BitDo Ultimate 2 Wireless (`2dc8:6012`). gilrs' bundled SDL DB only has a
+/// Windows row for it; on Linux/Bluetooth the right stick is on ABS_Z/ABS_RX
+/// (`LeftZ`/`RightStickX`) until an SDL mapping matches.
+pub const BITDO_ULTIMATE2_VID_PID: (u16, u16) = (0x2dc8, 0x6012);
+
+/// Stick axes after correcting pads whose right stick gilrs still exposes on
+/// `LeftZ`/`RightStickX` (no matching SDL row for this device version).
+/// `sdl_mapped` is true when gilrs already applied an SDL gamecontroller row.
+pub fn stick_axes(
+    left: [f32; 2],
+    right: [f32; 2],
+    left_z: f32,
+    vendor: Option<u16>,
+    product: Option<u16>,
+    sdl_mapped: bool,
+) -> ([f32; 2], [f32; 2]) {
+    if !sdl_mapped
+        && vendor == Some(BITDO_ULTIMATE2_VID_PID.0)
+        && product == Some(BITDO_ULTIMATE2_VID_PID.1)
+    {
+        // Default map: RightStickX is the stick's Y, LeftZ its X; RightStickY
+        // is the right trigger and must not drive look.
+        (left, [left_z, right[0]])
+    } else {
+        (left, right)
+    }
+}
+
 /// A radial deadzone: inside it the stick is centred; beyond it the rest of
 /// the travel is rescaled to 0..1 in the same direction, so diagonals aren't
 /// clipped and the first movement past the deadzone is small.
@@ -647,6 +724,43 @@ pub fn look_delta(
         x * YAW_SPEED * speed * seconds,
         -y * PITCH_SPEED * speed * seconds,
     )
+}
+
+/// Angular speeds below this (degrees per second) are sensor noise.
+pub const GYRO_NOISE: f32 = 0.35;
+
+/// Whether the gyroscope drives the view now: `aiming` is the use button
+/// (ZL on a Switch) being held.
+pub fn gyro_active(settings: &PadSettings, aiming: bool) -> bool {
+    match settings.gyro {
+        GyroMode::Off => false,
+        GyroMode::Always => true,
+        GyroMode::Aiming => aiming,
+    }
+}
+
+/// The view turn from the gyroscope over `seconds`: `(yaw, pitch)` in
+/// degrees, pitch positive looking down as in [`look_delta`], so the two add.
+/// `rate` is the pad's angular speed in degrees per second as `[yaw, pitch]`:
+/// yaw positive turning right, pitch positive tilting the top of the pad up
+/// (the backend maps the sensor's axes to these). A spyglass halves it.
+pub fn gyro_delta(
+    rate: [f32; 2],
+    settings: &PadSettings,
+    seconds: f32,
+    scoping: bool,
+) -> (f32, f32) {
+    let clean = |r: f32| {
+        if r.is_finite() && r.abs() > GYRO_NOISE {
+            r - r.signum() * GYRO_NOISE
+        } else {
+            0.0
+        }
+    };
+    let speed = settings.gyro_sensitivity * 2.0 * if scoping { 0.5 } else { 1.0 };
+    let yaw = clean(rate[0]) * if settings.gyro_invert_x { -1.0 } else { 1.0 };
+    let pitch = clean(rate[1]) * if settings.gyro_invert_y { -1.0 } else { 1.0 };
+    (yaw * speed * seconds, -pitch * speed * seconds)
 }
 
 /// The hotbar slot after a bumper: one step with wrap-around.
@@ -1236,6 +1350,38 @@ mod tests {
     }
 
     #[test]
+    fn ultimate2_right_stick_on_z_without_sdl() {
+        let (left, right) = stick_axes(
+            [0.2, 0.3],
+            [0.7, -0.9],
+            -0.5,
+            Some(BITDO_ULTIMATE2_VID_PID.0),
+            Some(BITDO_ULTIMATE2_VID_PID.1),
+            false,
+        );
+        assert_eq!(left, [0.2, 0.3]);
+        assert_eq!(right, [-0.5, 0.7], "X from LeftZ, Y from RightStickX");
+        let kept = stick_axes(
+            [0.2, 0.3],
+            [0.7, -0.9],
+            -0.5,
+            Some(BITDO_ULTIMATE2_VID_PID.0),
+            Some(BITDO_ULTIMATE2_VID_PID.1),
+            true,
+        );
+        assert_eq!(kept, ([0.2, 0.3], [0.7, -0.9]), "SDL row already remapped");
+        let other = stick_axes(
+            [0.0, 0.0],
+            [1.0, 0.0],
+            0.5,
+            Some(0x045e),
+            Some(0x028e),
+            false,
+        );
+        assert_eq!(other, ([0.0, 0.0], [1.0, 0.0]));
+    }
+
+    #[test]
     fn radial_deadzone_rescales() {
         assert_eq!(radial([0.1, 0.05], 0.15), [0.0, 0.0]);
         let full = radial([1.0, 0.0], 0.15);
@@ -1593,5 +1739,27 @@ mod tests {
         assert_eq!(GlyphStyle::of_vendor(Some(0x054c)), GlyphStyle::PlayStation);
         assert_eq!(GlyphStyle::of_vendor(Some(0x28de)), GlyphStyle::Xbox);
         assert_eq!(GlyphStyle::of_vendor(None), GlyphStyle::Xbox);
+    }
+
+    #[test]
+    fn gyro_turns_the_view_and_ignores_noise() {
+        let mut settings = PadSettings::default();
+        settings.gyro = GyroMode::Always;
+        // Half sensitivity is one degree per degree.
+        let (yaw, pitch) = gyro_delta([90.0 + GYRO_NOISE, 0.0], &settings, 1.0, false);
+        assert!((yaw - 90.0).abs() < 1e-3 && pitch == 0.0);
+        // Sensor noise does nothing.
+        assert_eq!(gyro_delta([0.2, -0.3], &settings, 1.0, false), (0.0, 0.0));
+        assert_eq!(gyro_delta([f32::NAN, 5.0], &settings, 1.0, false).0, 0.0);
+        // Tilting the pad up looks up (negative pitch), and inverting flips it.
+        assert!(gyro_delta([0.0, 10.0], &settings, 1.0, false).1 < 0.0);
+        settings.gyro_invert_y = true;
+        assert!(gyro_delta([0.0, 10.0], &settings, 1.0, false).1 > 0.0);
+        // Aiming mode needs the use button.
+        settings.gyro = GyroMode::Aiming;
+        assert!(!gyro_active(&settings, false) && gyro_active(&settings, true));
+        // The settings round-trip through the file.
+        settings.gyro_sensitivity = 0.75;
+        assert_eq!(PadSettings::parse(&settings.serialize()), settings);
     }
 }
