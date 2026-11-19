@@ -312,7 +312,7 @@ impl Game<'_> {
         let scoping = self.scoping();
         let (mut yaw, mut pitch) =
             gamepad::look_delta(self.pad.state.right, settings, seconds, scoping);
-        if gamepad::gyro_active(settings, self.pad.holds_action(settings, "key.use")) {
+        if gamepad::gyro_active(settings, settings.binding("key.use").is_some_and(|b| self.pad.edges.is_held(b))) {
             let (gyro_yaw, gyro_pitch) =
                 gamepad::gyro_delta(self.pad.gyro, settings, seconds, scoping);
             yaw += gyro_yaw;
