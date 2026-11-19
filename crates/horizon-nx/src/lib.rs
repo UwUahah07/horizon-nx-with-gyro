@@ -15,8 +15,6 @@
 pub mod compat;
 #[cfg(target_os = "horizon")]
 pub mod gyro;
-#[cfg(target_os = "horizon")]
-pub mod gyro;
 pub mod lifecycle;
 pub mod logging;
 
